@@ -1,33 +1,35 @@
+# coding: utf-8
+
 import math
 from datetime import datetime, timedelta
 
-from django.shortcuts import get_object_or_404, render
-from django.http import Http404, HttpResponse, HttpResponseRedirect, HttpResponseForbidden
-from django.contrib.auth.models import User
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth.models import User
 from django.contrib.sites.models import Site
-from django.core.urlresolvers import reverse
 from django.core.cache import cache
-from django.db.models import Q, F, Sum
-from django.utils.encoding import smart_str
+from django.core.urlresolvers import reverse
 from django.db import transaction
-from django.views.decorators.csrf import csrf_exempt
+from django.db.models import Q, F
+from django.http import Http404, HttpResponse, HttpResponseRedirect, HttpResponseForbidden
+from django.shortcuts import get_object_or_404, render
+from django.utils.encoding import smart_str
 from django.utils.translation import ugettext as _
-
-from djangobb_forum.util import build_form, paginate, set_language
-from djangobb_forum.models import Category, Forum, Topic, Post, Profile, Reputation, \
-    Attachment, PostTracking
-from djangobb_forum.forms import AddPostForm, EditPostForm, UserSearchForm, \
-    PostSearchForm, ReputationForm, MailToForm, EssentialsProfileForm, \
-    PersonalProfileForm, MessagingProfileForm, PersonalityProfileForm, \
-    DisplayProfileForm, PrivacyProfileForm, ReportForm, UploadAvatarForm
-from djangobb_forum.templatetags import forum_extras
-from djangobb_forum import settings as forum_settings
-from djangobb_forum.util import smiles, convert_text_to_html, TopicFromPostResult
-from djangobb_forum.templatetags.forum_extras import forum_moderated_by
+from django.views.decorators.csrf import csrf_exempt
 
 from haystack.query import SearchQuerySet, SQ
-from django.contrib import messages
+
+from djangobb_forum import settings as forum_settings
+from djangobb_forum.forms import AddPostForm, EditPostForm, UserSearchForm, \
+    PostSearchForm, ReputationForm, MailToForm, EssentialsProfileForm, \
+    VotePollForm, ReportForm, VotePollForm, PollForm
+from djangobb_forum.models import Category, Forum, Topic, Post, Reputation, \
+    Attachment, PostTracking
+from djangobb_forum.templatetags import forum_extras
+from djangobb_forum.templatetags.forum_extras import forum_moderated_by
+from djangobb_forum.util import build_form, paginate, set_language, smiles, convert_text_to_html
+
+
 
 from guardian.decorators import permission_required
 from guardian.decorators import permission_required_or_403
@@ -115,90 +117,141 @@ def moderate(request, forum_id):
             })
 
 def search(request):
-    # TODO: move to form
-    if 'action' in request.GET:
-        action = request.GET['action']
-        #FIXME: show_user for anonymous raise exception, 
-        #django bug http://code.djangoproject.com/changeset/14087 :|
-        user = get_user_object(request)
-        allowed = get_objects_for_user(user,'djangobb_forum.view_forum')
-        topics = Topic.objects.filter(Q(forum__in=allowed))
-
-        if action == 'show_24h':
-            date = datetime.today() - timedelta(1)
-            topics = topics.filter(created__gte=date)
-        elif action == 'show_new':
-            try:
-                last_read = PostTracking.objects.get(user=request.user).last_read
-            except PostTracking.DoesNotExist:
-                last_read = None
-            if last_read:
-                topics = topics.filter(last_post__updated__gte=last_read).all()
-            else:
-                #searching more than forum_settings.SEARCH_PAGE_SIZE in this way - not good idea :]
-                topics = [topic for topic in topics[:forum_settings.SEARCH_PAGE_SIZE] if forum_extras.has_unreads(topic, request.user)]
-        elif action == 'show_unanswered':
-            topics = topics.filter(post_count=1)
-        elif action == 'show_subscriptions':
-            topics = topics.filter(subscribers__id=request.user.id)
-        elif action == 'show_user':
-            user_id = request.GET['user_id']
-            posts = Post.objects.filter(user__id=user_id)
-            topics = [post.topic for post in posts if post.topic in topics]
-        elif action == 'search':
-            keywords = request.GET.get('keywords')
-            author = request.GET.get('author')
-            forum = request.GET.get('forum')
-            search_in = request.GET.get('search_in')
-            sort_by = request.GET.get('sort_by')
-            sort_dir = request.GET.get('sort_dir')
-
-            if not (keywords or author):
-                return HttpResponseRedirect(reverse('djangobb:search'))
-
-            query = SearchQuerySet().models(Post)
-
-            if author:
-                query = query.filter(author__username=author)
-
-            if forum != u'0':
-                query = query.filter(forum__id=forum)
-
-            if keywords:
-                if search_in == 'all':
-                    query = query.filter(SQ(topic=keywords) | SQ(text=keywords))
-                elif search_in == 'message':
-                    query = query.filter(text=keywords)
-                elif search_in == 'topic':
-                    query = query.filter(topic=keywords)
-            
-            for forum in Forum.objects.all():
-               if not user.has_perm('view_forum',forum):
-                    query = query.exclude(forum__id=forum.pk)
-
-            order = {'0': 'created',
-                     '1': 'author',
-                     '2': 'topic',
-                     '3': 'forum'}.get(sort_by, 'created')
-            if sort_dir == 'DESC':
-                order = '-' + order
-
-            posts = query.order_by(order)
-            if 'topics' in request.GET['show_as']:
-                return render(request, 'djangobb_forum/search_topics.html', {
-                    'results': TopicFromPostResult(posts)
-                })
-            elif 'posts' in request.GET['show_as']:
-                return render(request, 'djangobb_forum/search_posts.html', {'results': posts})
-
-        return render(request, 'djangobb_forum/search_topics.html', {'results': topics})
-    else:
-        form = PostSearchForm()
-        return render(request, 'djangobb_forum/search_form.html', {
-                'cats': get_permitted_catagories(request,'djangobb_forum.moderate_forum'),
+    # TODO: used forms in every search type
+    def _render_search_form(form=None):
+        return render(request, 'djangobb_forum/search_form.html', {'categories': Category.objects.all(),
                 'form': form,
                 })
 
+    if not 'action' in request.GET:
+        return _render_search_form(form=PostSearchForm())
+
+    if request.GET.get("show_as") == "posts":
+        show_as_posts = True
+        template_name = 'djangobb_forum/search_posts.html'
+    else:
+        show_as_posts = False
+        template_name = 'djangobb_forum/search_topics.html'
+
+    context = {}
+
+    #FIXME: show_user for anonymous raise exception, 
+    #django bug http://code.djangoproject.com/changeset/14087 :|
+    groups = request.user.groups.all() or [] #removed after django > 1.2.3 release
+    topics = Topic.objects.filter(
+               Q(forum__category__groups__in=groups) | \
+               Q(forum__category__groups__isnull=True))
+
+    base_url = None
+    _generic_context = True
+
+    action = request.GET['action']
+    if action == 'show_24h':
+        date = datetime.today() - timedelta(1)
+        topics = topics.filter(created__gte=date)
+    elif action == 'show_new':
+        try:
+            last_read = PostTracking.objects.get(user=request.user).last_read
+        except PostTracking.DoesNotExist:
+            last_read = None
+        if last_read:
+            topics = topics.filter(last_post__updated__gte=last_read).all()
+        else:
+            #searching more than forum_settings.SEARCH_PAGE_SIZE in this way - not good idea :]
+            topics = [topic for topic in topics[:forum_settings.SEARCH_PAGE_SIZE] if forum_extras.has_unreads(topic, request.user)]
+
+    elif action == 'show_unanswered':
+        topics = topics.filter(post_count=1)
+    elif action == 'show_subscriptions':
+        topics = topics.filter(subscribers__id=request.user.id)
+    elif action == 'show_user':
+        # Show all posts from user or topics started by user
+        user_id = request.GET.get("user_id", request.user.id)
+        user_id = int(user_id)
+        posts = Post.objects.filter(user__id=user_id)
+        base_url = "?action=show_user&user_id=%s&show_as=" % user_id
+        if not show_as_posts:
+            # show as topic
+            # FIXME: This should be speed up. This is not lazy:
+            user_topics = []
+            for post in posts:
+                topic = post.topic
+                if topic in topics and topic not in user_topics:
+                    user_topics.append(topic)
+            topics = user_topics
+    elif action == 'search':
+        form = PostSearchForm(request.GET)
+        if not form.is_valid():
+            return _render_search_form(form)
+
+        keywords = form.cleaned_data['keywords']
+        author = form.cleaned_data['author']
+        forum = form.cleaned_data['forum']
+        search_in = form.cleaned_data['search_in']
+        sort_by = form.cleaned_data['sort_by']
+        sort_dir = form.cleaned_data['sort_dir']
+
+        query = SearchQuerySet().models(Post)
+
+        if author:
+            query = query.filter(author__username=author)
+
+        if forum != u'0':
+            query = query.filter(forum__id=forum)
+
+        if keywords:
+            if search_in == 'all':
+                query = query.filter(SQ(topic=keywords) | SQ(text=keywords))
+            elif search_in == 'message':
+                query = query.filter(text=keywords)
+            elif search_in == 'topic':
+                query = query.filter(topic=keywords)
+
+        # add exlusions for categories user does not have access too
+        for category in Category.objects.all():
+            if not category.has_access(request.user):
+                query = query.exclude(category=category)
+
+        order = {'0': 'created',
+                 '1': 'author',
+                 '2': 'topic',
+                 '3': 'forum'}.get(sort_by, 'created')
+        if sort_dir == 'DESC':
+            order = '-' + order
+
+        posts = query.order_by(order)
+
+        if not show_as_posts:
+            # TODO: We have here a problem to get a list of topics without double entries.
+            # Maybe we must add a search index over topics?
+
+            # Info: If whoosh backend used, setup HAYSTACK_ITERATOR_LOAD_PER_QUERY
+            #    to a higher number to speed up
+            post_pks = posts.values_list("pk", flat=True)
+            context["topics"] = Topic.objects.filter(posts__in=post_pks).distinct()
+        else:
+            context["posts"] = posts
+
+        get_query_dict = request.GET.copy()
+        get_query_dict.pop("show_as")
+        base_url = "?%s&show_as=" % get_query_dict.urlencode()
+        _generic_context = False
+
+    if _generic_context:
+        if show_as_posts:
+            context["posts"] = Post.objects.filter(topic__in=topics).order_by('-created')
+        else:
+            context["topics"] = topics
+
+    if base_url is None:
+        base_url = "?action=%s&show_as=" % action
+
+    if show_as_posts:
+        context["as_topic_url"] = base_url + "topics"
+    else:
+        context["as_post_url"] = base_url + "posts"
+
+    return render(request, template_name, context)
 
 @login_required
 def misc(request):
@@ -226,11 +279,14 @@ def misc(request):
         if form.is_valid():
             user = get_object_or_404(User, username=request.GET['mail_to'])
             subject = form.cleaned_data['subject']
-            body = form.cleaned_data['body'] + '\n %s %s [%s]' % (Site.objects.get_current().domain,
+            body = form.cleaned_data['body'] + u'\n %s %s [%s]' % (Site.objects.get_current().domain,
                                                                   request.user.username,
                                                                   request.user.email)
-            user.email_user(subject, body, request.user.email)
-            messages.success(request, _("Email send."))
+            try:
+                user.email_user(subject, body, request.user.email)
+                messages.success(request, _("Email send."))
+            except Exception:
+                messages.error(request, _("Email could not be sent."))
             return HttpResponseRedirect(reverse('djangobb:index'))
 
     elif 'mail_to' in request.GET:
@@ -262,7 +318,14 @@ def show_forum(request, forum_id, full=True):
 
 @transaction.commit_on_success
 def show_topic(request, topic_id, full=True):
-
+    """
+    * Display a topic
+    * save a reply
+    * save a poll vote
+    
+    TODO: Add reply in lofi mode
+    """
+    post_request = request.method == "POST"
     topic = get_object_or_404(Topic.objects.select_related(), pk=topic_id)
     if not request.user.has_perm('djangobb_forum.view_forum',topic.forum):
         return HttpResponseForbidden()
@@ -285,27 +348,90 @@ def show_topic(request, topic_id, full=True):
     else:
         subscribed = False
 
+    # reply form
+    reply_form = None
+    form_url = None
+    back_url = None
+    if not topic.closed:
+        form_url = request.path + "#reply" # if form validation failed: browser should scroll down to reply form ;)
+        back_url = request.path
+        ip = request.META.get('REMOTE_ADDR', None)
+        post_form_kwargs = {"topic":topic, "user":request.user, "ip":ip}
+        if post_request and AddPostForm.FORM_NAME in request.POST:
+            reply_form = AddPostForm(request.POST, request.FILES, **post_form_kwargs)
+            if reply_form.is_valid():
+                post = reply_form.save()
+                messages.success(request, _("Your reply saved."))
+                return HttpResponseRedirect(post.get_absolute_url())
+        else:
+            reply_form = AddPostForm(
+                initial={
+                    'markup': request.user.forum_profile.markup,
+                    'subscribe': request.user.forum_profile.auto_subscribe,
+                },
+                **post_form_kwargs
+            )
+
+    # handle poll, if exists
+    poll_form = None
+    polls = topic.poll_set.all()
+    if not polls:
+        poll = None
+    else:
+        poll = polls[0]
+        if user.is_authenticated(): # Only logged in users can vote
+            poll.auto_deactivate()
+            has_voted = request.user in poll.users.all()
+            if not post_request or not VotePollForm.FORM_NAME in request.POST:
+                # It's not a POST request or: The reply form was send and not a poll vote
+                if poll.active and not has_voted:
+                    poll_form = VotePollForm(poll)
+            else:
+                if not poll.active:
+                    messages.error(request, _("This poll is not active!"))
+                    return HttpResponseRedirect(topic.get_absolute_url())
+                elif has_voted:
+                    messages.error(request, _("You have already vote to this poll in the past!"))
+                    return HttpResponseRedirect(topic.get_absolute_url())
+
+                poll_form = VotePollForm(poll, request.POST)
+                if poll_form.is_valid():
+                    ids = poll_form.cleaned_data["choice"]
+                    queryset = poll.choices.filter(id__in=ids)
+                    queryset.update(votes=F('votes') + 1)
+                    poll.users.add(request.user) # save that this user has vote
+                    messages.success(request, _("Your votes are saved."))
+                    return HttpResponseRedirect(topic.get_absolute_url())
+
     highlight_word = request.GET.get('hl', '')
     if full:
         return render(request, 'djangobb_forum/topic.html', {
                 'cats': get_permitted_catagories(request,'djangobb_forum.view_forum'),
                 'topic': topic,
                 'last_post': last_post,
-                'form': form,
+                'form_url': form_url,
+                'reply_form': reply_form,
+                'back_url': back_url,
                 'moderator': moderator,
                 'subscribed': subscribed,
                 'posts': posts,
                 'highlight_word': highlight_word,
+                'poll': poll,
+                'poll_form': poll_form,
                 })
     else:
         return render(request, 'djangobb_forum/lofi/topic.html', {
                 'cats': get_permitted_catagories(request,'djangobb_forum.view_forum'),
                 'topic': topic,
                 'posts': posts,
+                'poll': poll,
+                'poll_form': poll_form,
                 })
 
 
+"""
 @transaction.commit_on_success
+<<<<<<< HEAD
 def add_post(request, forum_id, topic_id):
     forum = None
     topic = None
@@ -338,17 +464,66 @@ def add_post(request, forum_id, topic_id):
         post_id = request.GET['post_id']
         post = get_object_or_404(Post, pk=post_id)
         form.fields['body'].initial = u"[quote=%s]%s[/quote]" % (post.user, post.body)
+=======
+"""
+@transaction.commit_on_success
+def add_topic(request, forum_id):
+    """
+    create a new topic, with or without poll
+    """
+    user = request.user
+    if request.user.is_anonymous():
+        user = get_anonymous_user()
+    forum = get_object_or_404(Forum, pk=forum_id)
+    if not user.has_perm('djangobb_forum.add_post',forum):
+        return HttpResponseForbidden()
 
-    if form.is_valid():
-        post = form.save();
-        messages.success(request, _("Topic saved."))
-        return HttpResponseRedirect(post.get_absolute_url())
+    ip = request.META.get('REMOTE_ADDR', None)
+    post_form_kwargs = {"forum":forum, "user":request.user, "ip":ip, }
 
-    return render(request, 'djangobb_forum/add_post.html', {'form': form,
-            'posts': posts,
-            'topic': topic,
-            'forum': forum,
-            })
+    if request.method == 'POST':
+        form = AddPostForm(request.POST, request.FILES, **post_form_kwargs)
+        if form.is_valid():
+            all_valid = True
+        else:
+            all_valid = False
+
+        poll_form = PollForm(request.POST)
+        create_poll = poll_form.create_poll()
+        if not create_poll:
+            # All poll fields are empty: User didn't want to create a poll
+            # Don't run validation and remove all form error messages
+            poll_form = PollForm() # create clean form without form errors
+        elif not poll_form.is_valid():
+            all_valid = False
+
+        if all_valid:
+            post = form.save()
+            if create_poll:
+                poll_form.save(post)
+                messages.success(request, _("Topic with poll saved."))
+            else:
+                messages.success(request, _("Topic saved."))
+            return HttpResponseRedirect(post.get_absolute_url())
+    else:
+        form = AddPostForm(
+            initial={
+                'markup': request.user.forum_profile.markup,
+                'subscribe': request.user.forum_profile.auto_subscribe,
+            },
+            **post_form_kwargs
+        )
+        if forum_id: # Create a new topic
+            poll_form = PollForm()
+
+    context = {
+        'forum': forum,
+        'create_poll_form': poll_form,
+        'form': form,
+        'form_url': request.path,
+        'back_url': forum.get_absolute_url(),
+    }
+    return render(request, 'djangobb_forum/add_topic.html', context)
 
 
 @transaction.commit_on_success

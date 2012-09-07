@@ -1,15 +1,17 @@
+# coding: utf-8
+
 from datetime import datetime
 import os
 import os.path
-import sys
 from hashlib import sha1
+import os
 
-from django.db import models
-from django.db.models.signals import post_save
-from django.contrib.auth.models import User, Group, Permission
 from django.conf import settings
+from django.contrib.auth.models import User, Group, Permission
+from django.db import models
+from django.db.models import aggregates
+from django.db.models.signals import post_save
 from django.utils.translation import ugettext_lazy as _
-
 from djangobb_forum.fields import AutoOneToOneField, ExtendedImageField, JSONField
 from djangobb_forum.util import smiles, convert_text_to_html
 from djangobb_forum import settings as forum_settings
@@ -317,6 +319,7 @@ class Profile(models.Model):
     show_signatures = models.BooleanField(_('Show signatures'), blank=True, default=True)
     show_smilies = models.BooleanField(_('Show smilies'), blank=True, default=True)
     privacy_permission = models.IntegerField(_('Privacy permission'), choices=PRIVACY_CHOICES, default=1)
+    auto_subscribe = models.BooleanField(_('Auto subscribe'), help_text=_("Auto subscribe all topics you have created or reply."), blank=True, default=False)
     markup = models.CharField(_('Default markup'), max_length=15, default=forum_settings.DEFAULT_MARKUP, choices=MARKUP_CHOICES)
     post_count = models.IntegerField(_('Post count'), blank=True, default=0)
 
@@ -414,6 +417,54 @@ class Attachment(models.Model):
     def get_absolute_path(self):
         return os.path.join(settings.MEDIA_ROOT, forum_settings.ATTACHMENT_UPLOAD_TO,
                             self.path)
+
+
+#------------------------------------------------------------------------------
+
+
+class Poll(models.Model):
+    topic = models.ForeignKey(Topic)
+    question = models.CharField(max_length=200)
+    choice_count = models.PositiveSmallIntegerField(default=1,
+        help_text=_("How many choices are allowed simultaneously."),
+    )
+    active = models.BooleanField(default=True,
+        help_text=_("Can users vote to this poll or just see the result?"),
+    )
+    deactivate_date = models.DateTimeField(null=True, blank=True,
+        help_text=_("Point of time after this poll would be automatic deactivated"),
+    )
+    users = models.ManyToManyField(User, blank=True, null=True,
+        help_text=_("Users who has voted this poll."),
+    )
+    def auto_deactivate(self):
+        if self.active and self.deactivate_date:
+            now = datetime.now()
+            if now > self.deactivate_date:
+                self.active = False
+                self.save()
+
+    def __unicode__(self):
+        return self.question
+
+
+class PollChoice(models.Model):
+    poll = models.ForeignKey(Poll, related_name="choices")
+    choice = models.CharField(max_length=200)
+    votes = models.IntegerField(default=0, editable=False)
+
+    def percent(self):
+        if not self.votes:
+            return 0.0
+        result = PollChoice.objects.filter(poll=self.poll).aggregate(aggregates.Sum("votes"))
+        votes_sum = result["votes__sum"]
+        return float(self.votes) / votes_sum * 100
+
+    def __unicode__(self):
+        return self.choice
+
+
+#------------------------------------------------------------------------------
 
 
 from .signals import post_saved, topic_saved
